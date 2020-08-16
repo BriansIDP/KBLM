@@ -8,9 +8,9 @@ mkdir -p models
 
 exp_no=1
 dataset=SWBD_NE
-tag=KBforcing
+tag=surface_post
 
-python train_with_dataloader_debug.py \
+python train.py \
     --data ${PWD}/data/${dataset} \
     --cuda \
     --emsize 256 \
@@ -21,7 +21,7 @@ python train_with_dataloader_debug.py \
     --epochs 30 \
     --lr 10.0 \
     --tagloss-scale 0.0 \
-    --attloss-scale 0.1 \
+    --attloss-scale 0.0 \
     --clip 0.25 \
     --nlayers 1 \
     --batch_size 24 \
@@ -30,12 +30,17 @@ python train_with_dataloader_debug.py \
     --wdecay 1e-6 \
     --model LSTM \
     --reset 0 \
-    --logfile LOGs/vanillaLSTM_${dataset}_${exp_no}.classKBlstm_enc_${tag}.log \
-    --save models/model.${dataset}_${exp_no}.classKBlstm_enc_${tag}.pt \
-    --useKB \
+    --logfile LOGs/vanillaLSTM_${dataset}_${exp_no}.KB${tag}.log \
+    --save models/model.${dataset}_${exp_no}.KB${tag}.pt \
+    --classnorm \
+    --tied \
+    --useKB KB \
+    --usesurface \
     --rampup \
     --gating \
     --nhop 1 \
+    --post \
+    --attn-levels 2 \
     # --from-pretrain \
     # --pretrain-dim 768 \
     # --log-interval 10 \

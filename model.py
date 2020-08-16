@@ -1,8 +1,9 @@
 from __future__ import print_function
 import torch.nn as nn
+import math
 from torch import cat, randn_like, einsum, zeros, stack
 from torch.autograd import Variable
-from MemEnc import EncoderMemNN
+from MemEnc import EncoderMemNN, EncoderTreeMemNN
 
 
 class RNNModel(nn.Module):
@@ -10,36 +11,36 @@ class RNNModel(nn.Module):
 
     def __init__(self, ntoken, nclass, ninp, nhid_class, class_masks, nhid, nlayers,
                  KB=None, rnndrop=0.5, dropout=0.5, reset=0, useKB=False, pad=0, hop=1,
-                 lstm_enc=False, post=True, pretrain=False, pretrain_dim=0, KBvalues=None):
+                 lstm_enc=False, post=True, pretrain=False, pretrain_dim=0,
+                 KBvalues=None, usesurface=True, classnorm=False, tied=False, levels=1):
         super(RNNModel, self).__init__()
         self.drop = nn.Dropout(dropout)
         self.dropclass = nn.Dropout(dropout)
         self.encoder = nn.Embedding(ntoken, ninp)
-        if not post:
-            self.rnn = nn.LSTM(ninp * 2, nhid, nlayers, dropout=rnndrop)
-        else:
-            self.rnn = nn.LSTM(ninp, nhid, nlayers, dropout=rnndrop)
+        self.rnn = nn.LSTM(ninp, nhid, nlayers, dropout=rnndrop)
         self.class_encoder = nn.Embedding(nclass, nhid_class)
         self.LMhead = nn.Linear(nhid, ninp)
-        if useKB:
+        if (useKB or tied) and ninp != nhid:
             self.LMdecoder = nn.Linear(ninp, ntoken)
             self.CLdecoder = nn.Linear(nhid_class, nclass)
         else:
             self.LMdecoder = nn.Linear(nhid, ntoken)
             self.CLdecoder = nn.Linear(nhid_class, nclass)
-        # self.CLhead = nn.Linear(nhid_class, nhid)
-        # self.CLdecoder.weight = self.class_encoder.weight
-        # Memory network
-        if useKB and KB is not None:
-            nentries = KB.size(0)
-            seqlen = KB.size(1)
-            self.MemNet = EncoderMemNN(ntoken, ninp, hop, dropout, pad, nhid,
-                                       nentries, seqlen, lstm_enc, pretrain, pretrain_dim)
+        self.KBgate = nn.Linear(ninp+nhid, nclass)
+        if tied:
             # Tie weight
             self.LMdecoder.weight = self.encoder.weight
-
         self.init_weights()
+        # Memory network
+        if (useKB and KB is not None):
+            if usesurface:
+                self.MemNet = EncoderMemNN(ntoken, ninp, hop, dropout, pad, nhid,
+                                           lstm_enc, pretrain, pretrain_dim)
+            else:
+                self.MemNet = EncoderTreeMemNN(ntoken, ninp, hop, dropout, pad, nhid,
+                                             lstm_enc, pretrain, pretrain_dim)
 
+        self.tied = tied
         self.nhid = nhid
         self.class_masks = class_masks
         self.nclass = nclass
@@ -50,6 +51,8 @@ class RNNModel(nn.Module):
         self.KB = KB
         self.ninp = ninp
         self.post = post
+        self.classnorm = classnorm
+        self.levels = levels
 
     def init_weights(self):
         initrange = 0.1
@@ -61,8 +64,11 @@ class RNNModel(nn.Module):
         self.LMdecoder.weight.data.uniform_(-initrange, initrange)
         self.CLdecoder.bias.data.zero_()
         self.CLdecoder.weight.data.uniform_(-initrange, initrange)
+        self.KBgate.bias.data.zero_()
+        self.KBgate.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, words, classes, hidden, gating=False, rampup=False, ramp_factor=1, true_ents=None):
+    def forward(self, words, classes, hidden, gating=False, rampup=False, ramp_factor=1,
+                true_ents=None, true_class=None, entities=None, forcing_p=0.0):
         seq_len = words.size(0)
         bsize = words.size(1)
         emb = self.drop(self.encoder(words))
@@ -75,62 +81,69 @@ class RNNModel(nn.Module):
         if true_ents is not None:
             true_ents = true_ents.view(seq_len, bsize)
 
-        KB_embedding = None
+        KB_embedding = zeros(1, bsize, self.ninp).to(device=emb.device)
         eachoutput = emb[0:1, :, :]
         output = []
         class_distributions = []
         att_list = []
+        mem_list = []
         for i in range(seq_len):
-            if self.useKB and not self.post:
-            #     query = self.LMhead(hidden[0][-1:,:,:].view(bsize, -1))
-            #     KB_embedding, att = self.MemNet(self.KB, query, self.encoder.weight.data)
-            #     att_list.append(att)
-                to_input = cat([emb[i:i+1, :, :], eachoutput], dim=2)
-            else:
-                to_input = emb[i:i+1, :, :],
+            to_input = emb[i:i+1, :, :]
+            # if self.useKB and not self.post:
+            #     to_input = cat([to_input, eachoutput], dim=-1)
+                # hidden = (eachoutput, hidden[-1])
             eachoutput, hidden = self.rnn(to_input, hidden)
 
-            # forward class distribution
-            class_output = self.dropclass(eachoutput)
-            class_decoded = self.CLdecoder(class_output.view(bsize, -1))
+            if (self.tied or self.useKB) and self.ninp != self.nhid:
+                eachoutput = self.LMhead(eachoutput)
+
+            if self.useKB == "KB" and not self.post:
+                KB_embedding, att = self.MemNet(self.KB if entities is None else entities,
+                                                hidden[1][-1],
+                                                self.encoder.weight.data,
+                                                true_ents[i, :] if true_ents is not None else None,
+                                                hierarchical=self.levels)
+                class_distribution = nn.functional.softmax(self.KBgate(cat([eachoutput, KB_embedding], dim=-1)), dim=1)
+                gate = class_distribution[:,0:1]
+                KB_embedding = math.floor(ramp_factor) * KB_embedding.unsqueeze(0)
+                eachoutput = (1 - gate) * eachoutput + gate * KB_embedding
+                att_list.append(att)
+            class_decoded = self.CLdecoder(eachoutput.view(bsize, -1))
             class_distribution = nn.functional.softmax(class_decoded, dim=1)
             class_distributions.append(class_distribution)
-
-            if self.useKB:
-                eachoutput = self.LMhead(eachoutput)
-                if not self.post:
-                    KB_embedding, att = self.MemNet(self.KB,
-                                                    eachoutput.view(bsize, -1),
-                                                    self.encoder.weight.data,
-                                                    true_ents[i, :] if true_ents is not None else None)
-                    eachoutput = eachoutput + 0.5 * ramp_factor * class_distribution[:,1:] * KB_embedding
-                    att_list.append(att)
-
             output.append(eachoutput)
+            mem_list.append(hidden[1][-1].unsqueeze(0))
         output = cat(output, dim=0).view(seq_len*bsize, -1)
         att = stack(att_list).view(seq_len*bsize, -1) if len(att_list) > 0 else None
+        mem_list = cat(mem_list, dim=0).view(seq_len*bsize, -1)
         class_distribution = stack(class_distributions).view(seq_len*bsize, -1)
 
-        # class_output = self.dropclass(output)
-        # class_decoded = self.CLdecoder(class_output.view(seq_len*bsize, -1))
-        # [seq_len*bsize, nclass] -> [seq_len*bsize, 1, nclass]
-        # class_distribution = nn.functional.softmax(class_decoded, dim=1)
         # Query the knowledge base
-        if self.useKB and self.post:
+        if self.useKB == "KB" and self.post:
             # [seq_len*bsize, ninp]
-            KB_embedding, att = self.MemNet(self.KB, output, self.encoder.weight.data)
-            gate = class_distribution[:,1:]
-            output = output + 0.5 * ramp_factor * gate * KB_embedding
+            KB_embedding, att = self.MemNet(self.KB if entities is None else entities,
+                                            mem_list.detach(),
+                                            self.encoder.weight.data,
+                                            true_ents=true_ents,
+                                            hierarchical=self.levels,
+                                            forcing_p=forcing_p)
+            # gate = nn.functional.softmax(self.KBgate(cat([output, KB_embedding.detach()], dim=-1)), dim=1)[:,0:1]
+            gate = class_distribution[:,0:1]
+            # gate = 1 - true_class.unsqueeze(-1).to(KB_embedding.dtype)
+            output = output  + math.floor(ramp_factor) * gate * KB_embedding
         output = self.drop(output)
         # [seq_len*bsize, ntoken]
         decoded = self.LMdecoder(output)
-        # [seq_len*bsize, nclass, ntoken]
-        expanded_wordout = decoded.unsqueeze(1).repeat(1, self.nclass, 1)
-        expanded_wordout.masked_fill_(self.class_masks, float(-1e9))
-        masked_worddist = nn.functional.softmax(expanded_wordout, dim=2)
-        # [seq_len*bsize, 1, nclass] * [seq_len*bsize, nclass, ntoken] -> [seq_len*bsize, 1, ntoken]
-        summed_prob = einsum('bij,bjk->bik', class_distribution.unsqueeze(1), masked_worddist)
-        return summed_prob.squeeze(1), class_distribution.squeeze(1), hidden, att
+        if self.classnorm:
+            # [seq_len*bsize, nclass, ntoken]
+            expanded_wordout = decoded.unsqueeze(1).repeat(1, self.nclass, 1)
+            expanded_wordout.masked_fill_(self.class_masks, float(-1e9))
+            masked_worddist = nn.functional.softmax(expanded_wordout, dim=2)
+            # [seq_len*bsize, 1, nclass] * [seq_len*bsize, nclass, ntoken] -> [seq_len*bsize, 1, ntoken]
+            summed_prob = einsum('bij,bjk->bik', class_distribution.unsqueeze(1), masked_worddist).squeeze(1)
+        else:
+            summed_prob = decoded
+        return summed_prob, class_distribution.squeeze(1), hidden, att
 
     def init_hidden(self, bsz):
         weight = next(self.parameters())

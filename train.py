@@ -9,6 +9,7 @@ from operator import itemgetter
 
 import dataloader
 from model import RNNModel
+from KB_utils import KB_manager
 
 arglist = []
 parser = argparse.ArgumentParser(description='PyTorch Wikitext-2 RNN/LSTM Language Model')
@@ -80,6 +81,8 @@ parser.add_argument('--use_extra', action='store_true',
                     help='Use duplicated part of training set')
 parser.add_argument('--useKB', default='',
                     help='Type of Knowledge Base')
+parser.add_argument('--usesurface', action='store_true',
+                    help='use knowledge surface form')
 parser.add_argument('--gating', action='store_true',
                     help='Use class probability to gate the KB')
 parser.add_argument('--rampup', action='store_true',
@@ -104,6 +107,15 @@ parser.add_argument('--from-pretrain', action='store_true',
                     help='use pretrained LM for context/KB embeddings')
 parser.add_argument('--pretrain-dim', type=int, default=0,
                     help='output dimension from pretrained system')
+parser.add_argument('--classnorm', action='store_true',
+                    help='use class distribution to normalise probs')
+parser.add_argument('--attn-levels', type=int, default=1,
+                    help='to perform a multilevel attention')
+parser.add_argument('--load-from', type=str, default='',
+                    help='load RNNLM from trained model')
+parser.add_argument('--KBsize', type=int, default=0,
+                    help='The size of the KB for each minibatch')
+
 args = parser.parse_args()
 
 arglist.append(('Data', args.data))
@@ -119,6 +131,7 @@ arglist.append(('Sequence Length', args.bptt))
 arglist.append(('Dropout', args.dropout))
 arglist.append(('Loss Function', args.loss))
 arglist.append(('Class hidden dim', args.nhid_class))
+arglist.append(('Use class prob to normalise', args.classnorm))
 arglist.append(('Use KB', args.useKB))
 arglist.append(('Use Gating', args.gating))
 arglist.append(('Use LR Rampup', args.rampup))
@@ -130,6 +143,7 @@ arglist.append(('Teacher forcing to train KB', args.KBforcing))
 arglist.append(('Attn loss scaling factor', args.attloss_scale))
 arglist.append(('Use LSTM encoder', args.lstmenc))
 arglist.append(('Use pretrained LM', args.from_pretrain))
+arglist.append(('KB retrieval size', args.KBsize))
 
 def logging(s, logging_=True, log_=True):
     if logging_:
@@ -150,13 +164,18 @@ device = torch.device("cuda" if args.cuda else "cpu")
 # Load data
 ###############################################################################
 train_loader, val_loader, test_loader, dictionary, class_dict = dataloader.create(
-    args.data, batchSize=100000000, use_extra=args.KBforcing)
+    args.data, batchSize=100000000, use_label=True)
 eosidx = dictionary.get_eos()
 KB = None
-if args.useKB == "KB":
+if args.useKB in ["KB", "None"]:
     KB = dataloader.KB(args.data, dictionary, eosidx, args.from_pretrain).to(device)
 elif args.useKB == "KG":
-    KGkeys, KGvalues = dataloader.KG(args.data, dictionary, graphlen=3)
+    KB, KGvalues = dataloader.KG(args.data, dictionary, graphlen=3)
+    KB = KB.to(device)
+    KGvalues = KGvalues.to(device)
+
+# Small KB collection
+KBmanager = KB_manager(KB, args.bptt)
 
 # Get sub-dictionary masks
 subdictmask = torch.ones(len(class_dict), len(dictionary))
@@ -206,21 +225,37 @@ nclasses = len(class_dict)
 if args.useKB != "":
     if args.resume:
         model = torch.load(args.save)
-    elif args.useKB == "KB":
+    elif args.useKB in ["KB", "None"]:
+        model = RNNModel(ntokens, nclasses, args.emsize, args.nhid_class, subdictmask.to(device),
+                        args.nhid, args.nlayers, KB, args.rnndrop, args.dropout, reset=args.reset,
+                        useKB=args.useKB, pad=eosidx, hop=args.nhop, lstm_enc=args.lstmenc,
+                        post=args.post, pretrain=args.from_pretrain, pretrain_dim=args.pretrain_dim,
+                        classnorm=args.classnorm, tied=args.tied, levels=args.attn_levels)
+    elif args.useKB == "KG":
         model = RNNModel(ntokens, nclasses, args.emsize, args.nhid_class, subdictmask.to(device),
                         args.nhid, args.nlayers, KB, args.rnndrop, args.dropout, reset=args.reset,
                         useKB=True, pad=eosidx, hop=args.nhop, lstm_enc=args.lstmenc,
-                        post=args.post, pretrain=args.from_pretrain, pretrain_dim=args.pretrain_dim)
-    elif args.useKB == "KG":
-        model = RNNModel(ntokens, nclasses, args.emsize, args.nhid_class, subdictmask.to(device),
-                        args.nhid, args.nlayers, KGkeys, args.rnndrop, args.dropout, reset=args.reset,
-                        useKB=True, pad=eosidx, hop=args.nhop, lstm_enc=args.lstmenc,
-                        post=args.post, KBvalues=KGvalues)
+                        post=args.post, KBvalues=KGvalues, usesurface=args.usesurface,
+                        classnorm=args.classnorm, tied=args.tied, levels=args.attn_levels)
 else:
-    model = RNNModel(ntokens, nclasses, args.emsize, args.nhid_class, subdictmask.to(device), args.nhid, args.nlayers, None, args.rnndrop, args.dropout, reset=args.reset)
-criterion = nn.NLLLoss()
-interpCrit = nn.NLLLoss(reduction='none')
-att_criterion = nn.CrossEntropyLoss(ignore_index=0)
+    model = RNNModel(ntokens, nclasses, args.emsize, args.nhid_class, subdictmask.to(device), args.nhid,
+                     args.nlayers, None, args.rnndrop, args.dropout, reset=args.reset,
+                     classnorm=args.classnorm, tied=args.tied)
+# Initialise with trained parameters
+if args.load_from != '':
+    pretrained_dict = torch.load(args.load_from).state_dict()
+    model_dict = model.state_dict()
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
+
+if args.classnorm:
+    criterion = nn.NLLLoss()
+    interpCrit = nn.NLLLoss(reduction='none')
+else:
+    criterion = nn.CrossEntropyLoss()
+    interpCrit = nn.CrossEntropyLoss(reduction='none')
+att_criterion = nn.CrossEntropyLoss(reduction='none', ignore_index=0)
 
 if args.cuda:
     model.cuda()
@@ -284,41 +319,59 @@ def evaluate(data_source, eval_labels, eval_att=None, rampfactor=1.0):
     total_word_loss = 0.
     total_oracle_loss = 0.
     total_atten_loss = 0.
+    total_NE = 0.
     stout = []
     ntokens = len(dictionary)
     hidden = model.init_hidden(eval_batch_size)
+    att_criterion.reduction = "none"
     with torch.no_grad():
         for i in range(0, data_source.size(0) - 1, args.bptt):
             data, targets, inputlabel, labels, _, atttarget = get_batch(data_source, eval_labels, i, train_att=eval_att)
-            # gs534 add sentence resetting
-            worddist, classdist, hidden, attprob = model(data, inputlabel, hidden, args.gating, args.rampup, rampfactor)
-            word_loss = criterion(torch.log(worddist), targets)
+            # get att targets
+            # thisKB, atttarget = KBmanager.get_this_KB_test(atttarget)
+            # Use true KB entries or predicted entries
+            # print(atttarget)
+            if args.KBforcing:
+                worddist, classdist, hidden, attprob = model(
+                    data, inputlabel, hidden, args.gating, args.rampup, rampfactor,
+                    true_ents=atttarget, true_class=labels, entities=KBmanager.testKB)
+            else:
+                worddist, classdist, hidden, attprob = model(
+                    data, inputlabel, hidden, args.gating, args.rampup, rampfactor,
+                    true_class=labels, entities=KBmanager.testKB)
+            # Determine the output type
+            if args.classnorm:
+                word_loss = criterion(torch.log(worddist+1e-9), targets)
+                oracle_loss = interpCrit(torch.log(worddist), targets)
+            else:
+                word_loss = criterion(worddist, targets)
+                oracle_loss = interpCrit(worddist, targets)
             if args.use_dsc:
                 tag_loss = DSC(classdist, labels)
             else:
                 tag_loss = criterion(torch.log(classdist), labels)
-            attention_loss = att_criterion(attprob, atttarget) if atttarget is not None else 0.
+            attention_loss = att_criterion(attprob, atttarget) if attprob is not None else torch.zeros(1)
             # calculate NE loss
-            oracle_loss = interpCrit(torch.log(worddist), targets)
-            label_mask = labels != 0
-            oracle_loss = torch.sum(oracle_loss * label_mask.float()) / eval_batch_size
+            label_mask = labels != 1
+            oracle_loss = torch.sum(oracle_loss * label_mask.float())
             total_oracle_loss += oracle_loss
+            total_NE += torch.sum(label_mask)
 
             if args.stream_out:
                 final_prob = torch.gather(worddist, 1, targets.unsqueeze(1))
-                final_class_prob = classdist[:,1]
+                final_class_prob = classdist[:,0]
                 stout += list(zip(final_prob.squeeze(1).tolist(), final_class_prob.tolist(), targets.tolist()))
             total_word_loss += word_loss * data.size(0)
             total_tag_loss += tag_loss * data.size(0)
-            total_atten_loss += attention_loss * data.size(0)
+            total_atten_loss += attention_loss.sum()
             hidden = repackage_hidden(hidden)
         total_word_loss /= len(data_source)
         total_tag_loss /= len(data_source)
-        total_oracle_loss /= len(data_source)
-        total_atten_loss /= len(data_source)
+        total_oracle_loss /= total_NE
+        total_atten_loss /= total_NE
     return total_word_loss, stout, total_tag_loss, total_oracle_loss, total_atten_loss
 
-def train(model, train_data, train_label, train_att, lr, use_dsc=False):
+def train(epoch, model, train_data, train_label, train_att, lr, use_dsc=False, att_loss_scale=0.0):
     # Turn on training mode which enables dropout.
     model.train()
     total_tag_loss = 0.
@@ -329,10 +382,15 @@ def train(model, train_data, train_label, train_att, lr, use_dsc=False):
     start_time = time.time()
     ntokens = len(dictionary)
     hidden = model.init_hidden(args.batch_size)
+    att_criterion.reduction = "mean"
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=args.wdecay)
+    forcing_p = (1 - epoch / args.epochs) ** 2 * 0.5
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
-        data, targets, inputlabel, labels, attlabel, atttarget = get_batch(train_data, train_label, i, train_att=train_att)
+        data, targets, inputlabel, labels, attlabel, atttarget = get_batch(
+            train_data, train_label, i, train_att=train_att)
+        # get small KB for better attention
+        thisKB, atttarget = KBmanager.get_this_KB(batch, atttarget)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = repackage_hidden(hidden)
@@ -343,22 +401,32 @@ def train(model, train_data, train_label, train_att, lr, use_dsc=False):
             ramp_factor = (epoch - 1) / args.pre_epochs
         if args.KBforcing:
             worddist, classdist, hidden, att_prob = model(
-                data, inputlabel, hidden, args.gating, args.rampup, ramp_factor, true_ents=atttarget)
+                data, inputlabel, hidden, args.gating, args.rampup, ramp_factor,
+                true_ents=atttarget, true_class=labels, entities=thisKB, forcing_p=forcing_p)
         else:
             worddist, classdist, hidden, att_prob = model(
-                data, inputlabel, hidden, args.gating, args.rampup, ramp_factor)
-        word_loss = criterion(torch.log(worddist+1e-9), targets)
-        # calcualte attention loss
-        attention_loss = att_criterion(att_prob+1e-9, atttarget)
+                data, inputlabel, hidden, args.gating, args.rampup, ramp_factor,
+                true_class=labels, entities=thisKB)
+        # Determine the output type
+        if args.classnorm:
+            word_loss = criterion(torch.log(worddist+1e-9), targets)
+        else:
+            word_loss = criterion(worddist, targets)
 
         if args.use_dsc:
             tag_loss = DSC(classdist, labels)
         else:
             tag_loss = criterion(torch.log(classdist+1e-9), labels)
 
-        loss = word_loss + args.tagloss_scale * tag_loss + args.attloss_scale * attention_loss
+        loss = word_loss + args.tagloss_scale * tag_loss
+        # calcualte attention loss
+        if att_prob is not None:
+            attention_loss = att_criterion(att_prob, atttarget)
+            loss += attention_loss * att_loss_scale
+            # import pdb; pdb.set_trace()
         if torch.isnan(loss).any():
             import pdb; pdb.set_trace()
+            raise
         loss.backward()
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
@@ -368,7 +436,7 @@ def train(model, train_data, train_label, train_att, lr, use_dsc=False):
 
         total_word_loss += word_loss.item()
         total_tag_loss += tag_loss.item()
-        total_att_loss += attention_loss.item()
+        total_att_loss += attention_loss.item() if att_prob is not None else 0
 
         if batch % args.log_interval == 0 and batch > 0:
             cur_word_loss = total_word_loss / args.log_interval
@@ -398,6 +466,8 @@ for pairs in arglist:
 # Loop over epochs.
 lr = args.lr
 best_val_loss = None
+att_loss_scale = args.attloss_scale
+best_val_att_loss = None
 
 # At any point you can hit Ctrl + C to break out of training early.
 if not args.evalmode:
@@ -410,7 +480,9 @@ if not args.evalmode:
                 train_data = batchify(train_data, args.batch_size)
                 train_label = batchify(train_label, args.batch_size)
                 train_att = batchify(train_att, args.batch_size)
-                rampfactor = train(model, train_data, train_label, train_att, lr)
+                # split into small KBs
+                KBmanager.split_KB_entries(args.KBsize, train_att)
+                rampfactor = train(epoch, model, train_data, train_label, train_att, lr, att_loss_scale=att_loss_scale)
             
             # start cross-validation
             aggregate_valloss = 0.
@@ -424,6 +496,8 @@ if not args.evalmode:
                 val_data = batchify(val_data, eval_batch_size)
                 val_label = batchify(val_label, eval_batch_size)
                 val_att = batchify(val_att, eval_batch_size)
+                # split into small KBs
+                val_att = KBmanager.split_KB_entries_test(val_att)
                 val_loss, _, val_tag_loss, val_oracle_loss, val_att_loss = evaluate(val_data, val_label, val_att, rampfactor)
                 aggregate_valloss += databatchsize * val_loss
                 aggregate_valtagloss += databatchsize * val_tag_loss
@@ -437,7 +511,7 @@ if not args.evalmode:
             val_att_loss = aggregate_valattloss / total_valset
             logging('-' * 89)
             logging('| end of epoch {:3d} | time: {:5.2f}s | valid tag loss {:5.2f} | '
-                    'valid att loss {:2.2f} | valid oracle ppl {:2.2f} | valid ppl {:8.2f}'.format(
+                    'valid att loss {:2.2f} | valid oracle ppl {:2.3f} | valid ppl {:8.2f}'.format(
                         epoch, (time.time() - epoch_start_time),
                         val_tag_loss, val_att_loss, math.exp(val_oracle_loss), math.exp(val_loss)))
             logging('-' * 89)
@@ -449,6 +523,10 @@ if not args.evalmode:
             else:
                 # Anneal the learning rate if no improvement has been seen in the validation dataset.
                 lr /= 2.0
+            if not best_val_att_loss or val_att_loss < best_val_att_loss:
+                best_val_loss = val_loss
+            else:
+                att_loss_scale /= 4
     except KeyboardInterrupt:
         logging('-' * 89)
         logging('Exiting from training early')
@@ -463,20 +541,58 @@ with open(args.save, 'rb') as f:
 # Set cpu evaluate mode
 device = torch.device("cuda")
 
+if args.evalmode:
+    # start cross-validation
+    aggregate_valloss = 0.
+    aggregate_valtagloss = 0.
+    aggregate_valattloss = 0.
+    aggregate_valoracleloss = 0.
+    total_valset = 0
+    for val_batched in val_loader:
+        val_data, val_label, val_att = list(zip(*val_batched))
+        databatchsize = len(val_batched)
+        val_data = batchify(val_data, eval_batch_size)
+        val_label = batchify(val_label, eval_batch_size)
+        val_att = batchify(val_att, eval_batch_size)
+        # split into small KBs
+        val_att = KBmanager.split_KB_entries_test(val_att)
+        val_loss, _, val_tag_loss, val_oracle_loss, val_att_loss = evaluate(val_data, val_label, val_att)
+        aggregate_valloss += databatchsize * val_loss
+        aggregate_valtagloss += databatchsize * val_tag_loss
+        aggregate_valattloss += databatchsize * val_att_loss
+        aggregate_valoracleloss += databatchsize * val_oracle_loss
+        total_valset += databatchsize
+    # average losses over pieces of validation data
+    val_loss = aggregate_valloss / total_valset
+    val_tag_loss = aggregate_valtagloss / total_valset
+    val_oracle_loss = aggregate_valoracleloss / total_valset
+    val_att_loss = aggregate_valattloss / total_valset
+    logging('-' * 89)
+    logging('| valid tag loss {:5.2f} | '
+            'valid att loss {:2.2f} | valid oracle ppl {:2.3f} | valid ppl {:8.2f}'.format(
+                val_tag_loss, val_att_loss, math.exp(val_oracle_loss), math.exp(val_loss)))
+    logging('-' * 89)
+
 # Run on test data.
 test_start_time = time.time()
 # Write out probabilities
 if args.stream_out and args.evalmode:
     evalstfile = open('eval_1.st', 'w')
+# Start test evaluation
 total_testset = 0
 aggregate_testloss = 0.
 aggregate_testtagloss = 0
+aggregate_testattloss = 0
+aggregate_testoracleloss = 0.
 for test_batched in test_loader:
-    test_data, test_label = list(zip(*test_batched))
+    test_data, test_label, test_att = list(zip(*test_batched))
     databatchsize = len(test_batched)
     test_data = batchify(test_data, eval_batch_size)
     test_label = batchify(test_label, eval_batch_size)
-    test_loss, stout, test_tag_loss, oracle_loss = evaluate(test_data, test_label)
+    test_att = batchify(test_att, eval_batch_size)
+    # split into small KBs
+    test_att = KBmanager.split_KB_entries_test(test_att)
+    test_loss, stout, test_tag_loss, oracle_loss, test_att_loss = evaluate(test_data, test_label, test_att)
     if args.stream_out:
         evalstfile.write('P_word\tP_class\tWORD\n')
         for p1, p2, idx in stout:
@@ -484,12 +600,18 @@ for test_batched in test_loader:
             evalstfile.write('{:1.8f}\t{:1.8f}\t{}\n'.format(p1, p2, word))
     aggregate_testloss += databatchsize * test_loss
     aggregate_testtagloss += databatchsize * test_tag_loss
+    aggregate_testattloss += databatchsize * test_att_loss
+    aggregate_testoracleloss += databatchsize * oracle_loss
     total_testset += databatchsize
 test_loss = aggregate_testloss / total_testset
-logging('=' * 89)
-logging('| End of training | test loss {:5.2f} | test ppl {:8.2f} | oracle ppl {:8.2f}'.format(
-    test_loss, math.exp(test_loss), math.exp(oracle_loss)))
-logging('=' * 89)
+test_tag_loss = aggregate_testtagloss / total_testset
+test_att_loss = aggregate_testattloss / total_testset
+test_oracle_loss = aggregate_testoracleloss / total_testset
+logging('-' * 89)
+logging('| test tag loss {:5.2f} | '
+        'test att loss {:2.2f} | test oracle loss {:5.3f} | test ppl {:8.2f}'.format(
+            test_tag_loss, test_att_loss, math.exp(test_oracle_loss), math.exp(test_loss)))
+logging('-' * 89)
 logging('Test time cost: {:5.2f} ms'.format(time.time() - test_start_time))
 
 if len(args.onnx_export) > 0:

@@ -1,9 +1,10 @@
 import sys, os
 import random
+import json
 
 from torch.utils.data import Dataset, DataLoader
 import torch
-from fairseq.models.roberta import RobertaModel
+# from fairseq.models.roberta import RobertaModel
 
 class Dictionary(object):
     def __init__(self, dictfile):
@@ -51,7 +52,8 @@ class LMdata(Dataset):
             for j, tup in enumerate(zip(dataline.split(), labelline.split())):
                 word, label = tup
                 if atten_label_file is not None:
-                    self.attenlabel.append(int(random.choice(attenline[j].split(','))))
+                    # self.attenlabel.append(int(random.choice(attenline[j].split(','))))
+                    self.attenlabel.append(int(attenline[j].split(',')[0]))
                 if word in dictionary.word2idx:
                     self.data.append(dictionary.word2idx[word])
                 else:
@@ -70,12 +72,12 @@ class LMdata(Dataset):
         if self.attenlabel != []:
             return self.data[idx], self.label[idx], self.attenlabel[idx]
         else:
-            return self.data[idx], self.label[idx]
+            return self.data[idx], self.label[idx], None
 
 def collate_fn(batch):
     return batch
 
-def create(datapath, batchSize=1, shuffle=False, workers=0, use_label=False):
+def create(datapath, batchSize=1, shuffle=False, workers=0, use_label=True):
     loaders = []
     dictfile = os.path.join(datapath, 'dictionary.txt')
     dictionary = Dictionary(dictfile)
@@ -84,7 +86,7 @@ def create(datapath, batchSize=1, shuffle=False, workers=0, use_label=False):
     for i, split in enumerate(['train', 'valid', 'test']):
         data_file = os.path.join(datapath, dirs[i], '%s_nlp.txt' %split)
         label_file = os.path.join(datapath, dirs[i], 'new_%s_labels.txt' %split)
-        if split in ["train", "valid"] and use_label:
+        if use_label:
             atten_label_file = os.path.join(datapath, dirs[i], 'atten_labels.txt')
             dataset = LMdata(data_file, label_file, dictionary, class_dict, split, atten_label_file)
         else:
@@ -94,29 +96,29 @@ def create(datapath, batchSize=1, shuffle=False, workers=0, use_label=False):
                                   num_workers=workers))
     return loaders[0], loaders[1], loaders[2], dictionary, class_dict
 
-def KB(datapath, dictionary, padID, pretrain):
+def KB(datapath, dictionary, padID, pretrain=False):
     KBfile = os.path.join(datapath, 'normalised_ents.txt')
     maxlen = 0
     KBentries = []
     with open(KBfile) as fin:
         lines = fin.readlines()
 
-    if pretrain and not os.path.isfile("/home/dawna/gs534/KBauxLM/data/SWBD_NE/KB.pt"):
-        roberta = RobertaModel.from_pretrained(
-            '/home/dawna/gs534/fairseq/models/roberta.base', checkpoint_file='model.pt')
-        roberta.cuda()
-        maxlen = 0
-        for line in lines:
-            elems = line.strip().lower()
-            with torch.no_grad():
-                doc = roberta.extract_features_aligned_to_words(elems)
-            if len(doc[1:-1]) > maxlen:
-                maxlen = len(doc[1:-1])
-            KBentries.append(torch.stack([feat.vector for feat in doc[1:-1]]))
-        KB = torch.nn.utils.rnn.pad_sequence(KBentries, batch_first=True)
-        with open("/home/dawna/gs534/KBauxLM/data/SWBD_NE/KB.pt", 'wb') as f:
-            torch.save(KB, f)
-    elif pretrain:
+    # if pretrain and not os.path.isfile("/home/dawna/gs534/KBauxLM/data/SWBD_NE/KB.pt"):
+    #     roberta = RobertaModel.from_pretrained(
+    #         '/home/dawna/gs534/fairseq/models/roberta.base', checkpoint_file='model.pt')
+    #     roberta.cuda()
+    #     maxlen = 0
+    #     for line in lines:
+    #         elems = line.strip().lower()
+    #         with torch.no_grad():
+    #             doc = roberta.extract_features_aligned_to_words(elems)
+    #         if len(doc[1:-1]) > maxlen:
+    #             maxlen = len(doc[1:-1])
+    #         KBentries.append(torch.stack([feat.vector for feat in doc[1:-1]]))
+    #     KB = torch.nn.utils.rnn.pad_sequence(KBentries, batch_first=True)
+    #     with open("/home/dawna/gs534/KBauxLM/data/SWBD_NE/KB.pt", 'wb') as f:
+    #         torch.save(KB, f)
+    if pretrain:
         with open("/home/dawna/gs534/KBauxLM/data/SWBD_NE/KB.pt", 'rb') as f:
             KB = torch.load(f)
     else:
@@ -124,7 +126,9 @@ def KB(datapath, dictionary, padID, pretrain):
             elems = line.lower().split()
             ids = []
             for elem in elems:
-                if elem not in dictionary.idx2word:
+                if elem == '<void>':
+                    ids.append(dictionary.word2idx['<eos>'])
+                elif elem not in dictionary.idx2word:
                     ids.append(dictionary.word2idx['OOV'])
                 else:
                     ids.append(dictionary.word2idx[elem])
@@ -140,20 +144,26 @@ def KB(datapath, dictionary, padID, pretrain):
         KB = torch.LongTensor(KB)
     return KB
 
-def KG(datapath, dictionary, graphlen=3):
-    KBfile = os.path.join(datapath, 'entity_links_no_phrase.json')
-    KBentries = []
-    KBkeys = []
+def KG(datapath, dictionary, graphlen=5):
+    KBfile = os.path.join(datapath, 'entity_links', 'entity_links_no_phrase.json')
+    KBroot = os.path.join(datapath, 'normalised_ents.txt')
+    KBentries = [[dictionary.word2idx['OOV']] * graphlen]
+    KBkeys = [dictionary.word2idx['OOV']]
     with open(KBfile) as fin:
         Kgraph = json.load(fin)
-    for entity, links in Kgraph.items():
+    with open(KBroot) as fin:
+        ents = [line.strip() for line in fin]
+    # assert len(ents) == len(list(Kgraph.keys()))
+    for entity in ents:
         KBkeys.append(dictionary.word2idx[entity])
+        links = Kgraph[entity] if entity in Kgraph else []
         if len(links) > graphlen:
             links = links[:graphlen]
         else:
             links += [entity] * (graphlen - len(links))
         KBentries.append([dictionary.word2idx[link] for link in links])
-    return torch.LongTensor(KBkeys), torch.LongTensor(KBentries)
+    return torch.LongTensor(KBkeys).unsqueeze(1), torch.LongTensor(KBentries)
+
 
 if __name__ == "__main__":
     datapath = sys.argv[1]
